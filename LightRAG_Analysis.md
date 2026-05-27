@@ -270,14 +270,51 @@ LightRAG 提供 **4 种可选择的文本分块策略**：
 
 ### 3.6 🖼️ 原生多模态支持 (Multimodal RAG)
 
-LightRAG 通过集成 **RagAnything**（同团队项目），原生支持：
+LightRAG 通过集成同团队的 **RagAnything** 项目（[github.com/HKUDS/Rag-Anything](https://github.com/HKUDS/RAG-Anything)，独立项目，有专属论文 arXiv:2510.12323），实现全模态文档处理能力。
 
-- **文本** — 标准 RAG
+#### 三者关系说明
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    RagAnything                              │
+│            (All-in-One 多模态 RAG 框架)                      │
+│                                                             │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────┐ │
+│  │   MinerU      │  │   Docling     │  │  LightRAG Core │ │
+│  │   (解析引擎A)  │  │   (解析引擎B)  │  │  (KG+检索引擎) │ │
+│  │               │  │               │  │                │ │
+│  │ • PDF/图片OCR │  │ • Office文档  │  │ • 知识图谱构建  │ │
+│  │ • 表格提取    │  │ • HTML解析    │  │ • 双层检索      │ │
+│  │ • GPU加速     │  │ • 结构保留    │  │ • LLM生成      │ │
+│  └───────┬───────┘  └───────┬───────┘  └───────┬────────┘ │
+│          │                  │                   │          │
+│          ▼                  ▼                   ▼          │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │           统一多模态处理流水线                          │ │
+│  │  文档 → 解析(选MinerU或Docling) → 多模态sidecar数据    │ │
+│  │       → LightRAG索引(KG构建) → 多模态混合检索 → 回答   │ │
+│  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| 组件 | 定位 | 角色 | 来源 |
+|------|------|------|------|
+| **RagAnything** | 上层框架/胶水层 | 将多模态解析 + LightRAG 打包为端到端方案；实现双图构建（跨模态关系图 + 文本语义图）和跨模态混合检索 | HKUDS 同团队，[独立仓库](https://github.com/HKUDS/RAG-Anything) |
+| **MinerU** | 底层解析引擎（可选） | 擅长 PDF OCR、图片文字识别、复杂表格提取，支持 GPU 加速 | [open-source 项目](https://github.com/opendatalab/MinerU)（DataCanvas/OpenDataLab 团队） |
+| **Docling** | 底层解析引擎（可选） | 擅长 Office 文档、HTML 文件解析，更好保留原始文档结构和格式 | [IBM 开源项目](https://github.com/DS4SD/docling) |
+| **LightRAG** | 核心 RAG 引擎 | 提供知识图谱构建、双层检索、LLM 生成等核心 RAG 能力 | 本项目 |
+
+**关键理解**：
+- **RagAnything 不是 LightRAG 的一个模块，而是一个独立的上层项目**，它以 LightRAG 为内核，在之上封装了多模态文档解析和多模态知识图谱能力
+- **MinerU 和 Docling 是 RagAnything 可选的两种底层解析后端**，用户根据文档类型选择其一（MinerU 偏 PDF/扫描件，Docling 偏 Office/结构化文档）
+- LightRAG 自身的 [`multimodal_context.py`](https://github.com/HKUDS/LightRAG/blob/main/lightrag/multimodal_context.py) 负责**解析后数据的上下文增强**——即对解析出的图片/表格/公式元素，从原始文本中提取其前后文（surrounding context），使 VLM/LLM 在分析这些元素时能获得更完整的语境
+
+支持处理的模态：
+
+- **文本** — 标准 RAG 流程
 - **图片** — 通过 VLM（视觉语言模型）理解图像内容
-- **表格** — 结构化表格数据提取
+- **表格** — 结构化表格数据提取与语义理解
 - **数学公式** — LaTeX 公式识别与处理
-
-核心实现位于 [`multimodal_context.py`](https://github.com/HKUDS/LightRAG/blob/main/lightrag/multimodal_context.py)，通过 MinerU / Docling 服务进行多模态解析。
 
 ### 3.7 🎛️ 生产级工程特性
 

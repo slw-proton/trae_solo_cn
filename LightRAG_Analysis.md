@@ -81,6 +81,382 @@ LightRAG 的完整流程分为 **索引（Indexing）** 和 **查询（Querying�
 | **去重合并** | 跨 chunk 的同一实体自动合并；描述使用 Map-Reduce 摘要 | `operate.py` 中的 `_handle_entity_relation_summary` |
 | **三路存储** | 同时写入向量库 + 图数据库 + KV 存储 | 统一接口抽象 `BaseVectorStorage` / `BaseGraphStorage` / `BaseKVStorage` |
 
+### 2.1.1 深入：知识图谱构建 (KG Build) 的完整实现
+
+这是 LightRAG 索引阶段最核心的环节，全部实现在 [`operate.py`](https://github.com/HKUDS/LightRAG/blob/main/lightrag/operate.py)（~229KB，最大的单文件）中。
+
+#### Step 1：LLM 实体-关系抽取
+
+每个文本 chunk 被送入 LLM（使用 **EXTRACT 角色**），通过精心设计的 Prompt 抽取实体和关系。
+
+**System Prompt 核心指令**（来自 [`prompt.py`](https://github.com/HKUDS/LightRAG/blob/main/lightrag/prompt.py)）：
+
+```
+---Role---
+You are a Knowledge Graph Specialist responsible for extracting
+entities and relationships from the `---Input Text---` section.
+
+---Instructions---
+1. Entity Extraction: 对每个实体提取:
+   - entity_name: 实体名称（Title Case，全局一致命名）
+   - entity_type: 类型（Person/Organization/Location/Concept/...）
+   - entity_description: 基于输入文本的简洁描述
+
+2. Relationship Extraction: 对每对实体提取:
+   - source_entity: 源实体名
+   - target_entity: 目标实体名
+   - relationship_keywords: 关系关键词（逗号分隔）
+   - relationship_description: 关系性质说明
+```
+
+**严格定义的输出格式**：
+
+```text
+# 实体行（4 个字段，用 <|#|> 分隔）：
+entity<|#|>实体名称<|#|>实体类型<|#|>实体描述
+
+# 关系行（5 个字段）：
+relation<|#|>源实体<|#|>目标实体<|#|>关键词<|#|>关系描述
+
+# 结束标记：
+<|COMPLETE|>
+```
+
+**实际输出示例**（Prompt 中内置 Few-Shot Example）：
+
+```text
+entity<|#|>Dr. Elena Vasquez<|#|>Person<|#|>Dr. Elena Vasquez is a field researcher who led an expedition to document orangutan population decline in Borneo.
+entity<|#|>Borneo Rainforest<|#|>Location<|#|>The Borneo rainforest is the field site of the expedition and the primary habitat of the Bornean orangutan.
+entity<|#|>Bornean Orangutan<|#|>Creature<|#|>The Bornean orangutan is a primate species whose population was found to have declined to fewer than 1,500 individuals.
+relation<|#|>Dr. Elena Vasquez<|#|>Global Wildlife Conservation Institute<|#|>funded by, affiliation<|#|>The expedition led by Dr. Vasquez was funded by the Global Wildlife Conservation Institute.
+relation<|#|>Dr. Elena Vasquez<|#|>Bornean Orangutan<|#|>study subject, documentation<|#|>Dr. Vasquez's expedition aimed to document the population decline of the Bornean orangutan.
+<|COMPLETE|>
+```
+
+**关键设计细节**：
+
+| 设计点 | 说明 |
+|--------|------|
+| **自定义分隔符 `<\|#\|>`** | 避免与正文内容冲突，比逗号/竖线更安全 |
+| **先输出所有实体，再输出所有关系** | 保证关系的 source/target 都在已提取的实体集合内 |
+| **实体类型约束** | 内置 11 种预定义类型（Person/Organization/Location/Concept/Method/Creature/Event/Content/Data/Artifact/NaturalObject/Other），也可自定义 |
+| **无向关系默认** | 除非明确有向，否则 A→B 和 B→A 视为同一条关系 |
+| **Token 数限制** | `max_total_records` / `max_entity_records` 控制每次抽取量 |
+| **续抽机制** | 如果首次抽取未覆盖完整内容，会触发 `entity_continue_extraction_user_prompt` 补充抽取 |
+
+#### Step 2：解析与结构化
+
+LLM 原始输出经过以下处理链（`_handle_single_entity_extraction` 函数）：
+
+```
+LLM 原始文本输出
+    │
+    ▼
+json_repair.parse()  ← 容错 JSON 解析（修复 LLM 输出的格式错误）
+    │
+    ▼
+split_string_by_multi_markers()  ← 按 <|#|> 分割为字段数组
+    │
+    ▼
+sanitize_and_normalize_extracted_text()  ← 清理实体名（去引号、标准化空白、特殊字符处理）
+    │
+    ▼
+字段数校验: entity=4字段 / relation=5字段  ← 不符合格式的记录被丢弃并告警
+    │
+    ▼
+结构化结果:
+┌─────────────────────────────────────────────────────┐
+│ entities: [                                         │
+│   {                                                 │
+│     "entity_name": "Dr. Elena Vasquez",             │
+│     "entity_type": "Person",                        │
+│     "entity_description": "...",                    │
+│     "source_chunk": "chunk_abc123",                 │
+│     "file_path": "paper.pdf",                       │
+│     "timestamp": 1700000000                         │
+│   },                                                │
+│   ...                                               │
+│ ]                                                   │
+│                                                     │
+│ relations: [                                        │
+│   {                                                 │
+│     "source": "Dr. Elena Vasquez",                  │
+│     "target": "Bornean Orangutan",                   │
+│     "keywords": "study subject, documentation",      │
+│     "description": "...",                           │
+│     "source_chunk": "chunk_abc123",                 │
+│     "weight": 1                                     │
+│   },                                                │
+│   ...                                               │
+│ ]                                                   │
+└─────────────────────────────────────────────────────┘
+```
+
+#### Step 3：图存储写入（节点 = 实体，边 = 关系）
+
+解析后的数据通过 `knowledge_graph_inst`（实现 `BaseGraphStorage` 接口）写入图数据库：
+
+```python
+# 伪代码逻辑 (operate.py _insert_batch)
+
+for each extracted_entity:
+    # 1. 检查图中是否已存在同名实体
+    existing = await graph_storage.has_node(entity_name)
+
+    if not existing:
+        # 新实体 → 直接插入为节点
+        await graph_storage.upsert_node(
+            entity_name,
+            node_data={
+                "entity_type": entity_type,
+                "description": entity_description,
+                "source_id": chunk_key,
+                "file_path": file_path,
+            }
+        )
+        # 同时写入实体向量（用于 Local 检索）
+        entity_vector_content = f"{entity_name}: {entity_description}"
+        await entities_vdb.upsert({
+            entity_name: {
+                "content": entity_vector_content,
+                "embedding": embedding_func(entity_vector_content),  # 调用 Embedding 模型
+                ...
+            }
+        })
+    else:
+        # 已存在 → 触发合并流程（见下文 Dedup & Merge 部分）
+        await merge_existing_entity(entity_name, new_description)
+```
+
+**实体的向量索引内容格式**：
+
+```
+"Dr. Elena Vasquez: Dr. Elena Vasquez is a field researcher who led an expedition to document orangutan population decline in Borneo."
+```
+即 `实体名: 实体描述`，这样 Local 检索时可以通过语义相似度找到相关实体。
+
+**关系的向量索引内容格式**：
+
+```
+"Dr. Elena Vasquez -> study subject, documentation -> Bornean Orangutan: Dr. Vasquez's expedition aimed to document..."
+```
+即 `源实体 -> 关键词 -> 目标实体: 关系描述`，用于 Global 检索。
+
+#### Step 4：三路存储同步写入
+
+每次 `_insert_batch` 完成后，三路存储同时更新：
+
+| 存储类型 | 写入内容 | 用途 |
+|---------|---------|------|
+| **Vector DB (chunks_vdb)** | 原始文本 chunk 的向量 | Naive 检索 baseline |
+| **Vector DB (entities_vdb)** | `实体名: 描述` 的向量 | **Local 检索** — 找相关实体 |
+| **Vector DB (relationships_vdb)** | `源->关键词->目标: 描述` 的向量 | **Global 检索** — 找相关关系 |
+| **Graph Storage (kg)** | 节点(实体) + 边(关系) | 图遍历、路径查询 |
+| **KV Storage (full_docs)** | 文档元数据和状态 | 文档管理、增量追踪 |
+| **KV Storage (chunk_cache)** | chunk → 已处理状态映射 | 去重、断点续传 |
+| **KV Storage (llm_response_cache)** | LLM 调用结果缓存 | 避免重复调用 LLM |
+
+---
+
+### 2.1.2 深入：去重与合并 (Dedup & Merge) 的完整实现
+
+这是 LightRAG 区别于大多数 GraphRAG 方案的关键能力——**跨 chunk 的实体/关系如何智能合并**。
+
+#### 核心问题
+
+同一个实体可能在多个 chunk 中被反复提到，每次 LLM 抽取时生成的描述略有不同：
+
+```
+Chunk_3 提取: "Dr. Elena Vasquez is a field researcher who led an expedition to Borneo."
+Chunk_7 提取: "Dr. Elena Vasquez documented orangutan decline, funded by GWCI."
+Chunk_12提取: "Vasquez's team estimated fewer than 1,500 orangutans remained."
+```
+
+这三个描述指向**同一个实体**，需要合并为一个统一的实体描述。
+
+#### 实体匹配算法：基于名称的精确匹配
+
+```python
+# operate.py 中的核心逻辑（简化）
+
+async def _insert_batch(self, text_chunks, ...):
+    # 1. 对每个 chunk 做 LLM 抽取 → 得到 entities_dict 和 relations_dict
+    for chunk in text_chunks:
+        llm_output = await call_extract_llm(chunk.content)
+        entities, relations = parse_llm_output(llm_output)
+
+        # 2. 逐个处理实体
+        for entity_name, entity_data in entities.items():
+            # ★ 关键：用实体名作为唯一标识，查图中是否已存在
+            node_exists = await self.knowledge_graph_inst.has_node(entity_name)
+
+            if node_exists:
+                # 已存在 → 合并！
+                existing_entity = await kv_storage.get_by_id(entity_name)
+
+                # 收集所有历史描述 + 新描述
+                all_descriptions = existing_entity["descriptions"] + [entity_data["description"]]
+
+                # ★ 调用 Map-Reduce 摘要聚合
+                merged_description, used_llm = await _handle_entity_relation_summary(
+                    description_type="entity",
+                    entity_or_relation_name=entity_name,
+                    description_list=all_descriptions,       # 所有描述列表
+                    separator="\n",                         # 分隔符
+                    global_config=self.config,
+                )
+
+                # 更新实体的统一描述
+                await update_entity(entity_name, merged_description)
+            else:
+                # 新实体 → 直接插入
+                await insert_new_entity(entity_name, entity_data)
+```
+
+**匹配规则总结**：
+
+| 维度 | 规则 |
+|------|------|
+| **匹配键** | 实体名称字符串（**精确匹配**，非模糊/语义匹配） |
+| **大小写处理** | `sanitize_and_normalize_extracted_text()` 统一处理（Title Case 规范化） |
+| **名称长度限制** | 超过 `ENTITY_NAME_MAX_LENGTH` 的名称会被截断并告警 |
+| **匹配失败** | 名称不同的实体被视为不同实体，即使它们可能指代同一事物（如 "Elena Vasquez" vs "Dr. Vasquez"——这是当前的一个局限） |
+
+> ⚠️ **注意**：LightRAG 目前不做**模糊实体对齐**（Entity Resolution/Coreference Resolution）。如果 LLM 在不同 chunk 中用了略微不同的名字指同一实体（如 "Alex" vs "Alexander"），它们会被当作两个独立实体。这主要依赖 Prompt 中的 **"Ensure consistent naming"** 指令来缓解。
+
+#### 描述聚合：Map-Reduce 摘要策略（`_handle_entity_relation_summary`）
+
+这是合并阶段最精巧的部分。当同一实体积累了 N 个描述后，如何合并？
+
+```
+输入: description_list = ["描述A", "描述B", "描述C", ..., "描述N"]
+输出: 一个合并后的最终描述字符串
+```
+
+**三级递归 Map-Reduce 流程**：
+
+```
+                    ┌─ 描述总数 token ≤ summary_context_size？
+                    │         │
+          ┌── NO ──┘       ├── YES ──┐
+          │                      │
+    描述数量 ≤ 2？          描述数量 < force_llm_summary_on_merge
+    │         │              且 token < summary_max_tokens？
+    │  YES    │  NO           │         │
+    │   │     │   │       YES │        │ NO
+    │   ▼     │   ▼         ▼         ▼
+    │ 直接拼接  │ 分组(Map)  直接拼接   调 LLM 做最终摘要
+    │ 返回     │   ↓         返回      返回
+    │          │  各组调 LLM
+    │          │  摘要(Reduce)
+    │          │   ↓
+    │          │  新列表 = [摘要1, 摘要2, ...]
+    │          │   ↓
+    │          │  ╔════════╗
+    │          │  ║ 递归!  ║  ← 用新的更短的列表重新进入流程
+    │          │  ╚════════╝
+```
+
+**具体决策树**：
+
+```
+_handle_entity_relation_summary(description_list):
+
+情况 1: 只有 1 个描述
+  → 直接返回，无需任何处理
+
+情况 2: 总 token 数少 (≤ summary_context_size) 且 描述数量少 (< force_llm_summary_on_merge)
+  → 直接用 "\n".join() 拼接，不调 LLM（零成本）
+
+情况 3: 总 token 数少 但 描述数量多（或单个描述超长）
+  → 调用 LLM 做一次最终摘要（1 次 LLM 调用）
+
+情况 4: 总 token 数多（超出上下文窗口）
+  → Map phase: 将描述按 token 预算分组（每组 ≤ summary_context_size tokens）
+  → Reduce phase: 每组内部调 LLM 摘要（每组 1 次 LLM 调用）
+  → 得到缩短的新列表
+  → 递归回到入口，重复上述判断（通常下一轮就落入情况 2 或 3）
+```
+
+**示例演算**：
+
+假设一个实体在 50 个 chunk 中出现，产生了 50 个描述：
+
+```
+Round 1:
+  输入: 50 个描述, 总 token = 15000 (远超 summary_context_size=4000)
+  → Map: 分成 5 组 (每组 ~3000 tokens)
+  → Reduce: 5 组 × LLM摘要 = 5 次调用
+  输出: 5 个摘要描述
+
+Round 2:
+  输入: 5 个描述, 总 token = 3500 (≤ 4000 ✓)
+  但 5 ≥ force_llm_summary_on_merge (假设=3)
+  → 调 LLM 做最终摘要 = 1 次调用
+  输出: 1 个最终描述 ✓
+
+总计: 6 次 LLM 调用（而非 50 次或 1 次全量处理）
+```
+
+**LLM 摘要 Prompt**（`summarize_entity_descriptions`）：
+
+```text
+请将以下 {description_type} "{description_name}" 的多条描述
+合并为一个简洁的综合描述。
+
+要求:
+- 保留所有关键信息
+- 避免冗余和重复
+- 使用 {language} 输出
+- 控制长度在 {summary_length} 以内
+
+待合并的描述:
+{description_list}   ← JSONL 格式: {"Description":"..."}
+```
+
+#### 关系的合并逻辑
+
+关系的合并比实体更复杂，因为涉及**两端实体**：
+
+```
+Chunk_3 抽取: (Dr. Elena Vasquez) --[funded by]--> (Global Wildlife Conservation Institute)
+Chunk_7 抽取: (Dr. Elena Vasquez) --[affiliated with]--> (Global Wildlife Conservation Institute)
+```
+
+**合并策略**：
+
+| 场景 | 处理方式 |
+|------|---------|
+| **相同 (src, tgt) 对 + 相同 keywords** | 合并为一条，描述做 Map-Reduce 摘要 |
+| **相同 (src, tgt) 对 + 不同 keywords** | keywords 合并（逗号分隔），描述做 Map-Reduce 摘要 |
+| **新关系（两端实体都已存在）** | 直接添加新边 |
+| **新关系（一端或两端实体不存在）** | 先创建缺失的实体节点，再添加边 |
+
+**关系的唯一标识**（`make_relation_chunk_key`）：
+
+```python
+# 关系的 chunk key 格式
+relation_chunk_key = f"{src_entity}{GRAPH_FIELD_SEP}{tgt_entity}{GRAPH_FIELD_SEP}{keywords}"
+# 例: "Dr. Elena Vasquez<|-|>Global Wildlife Conservation Institute<|-|>funded by, affiliation"
+```
+
+相同的 `(source, target, keywords)` 三元组判定为同一条关系。
+
+#### 并发安全保障
+
+由于支持并发插入，LightRAG 使用**分布式锁**防止并发冲突：
+
+```python
+from lightrag.kg.shared_storage import get_storage_keyed_lock
+
+async def _insert_batch(...):
+    lock = get_storage_keyed_lock(f"insert:{namespace}")
+    async with lock:
+        # 整个插入+合并在锁内完成
+        # 确保同一命名空间不会被并发写入破坏
+        ...
+```
+
 ### 2.2 查询阶段流程（Querying Pipeline）
 
 ```
